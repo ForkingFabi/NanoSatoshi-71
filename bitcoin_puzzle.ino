@@ -1,11 +1,13 @@
 /**
- * ESP32 Bitcoin Puzzle Solver (Optimized for Speed)
- * Target: Puzzle 71 (Range: 2^70 to 2^71-1)
- * * Logic:
- * 1. Generate a random starting point within the defined range.
- * 2. Use ECC Point Addition (Q = Q + G) instead of Multiplication for speed.
- * 3. Batch process keys to reduce overhead.
- * 4. Run on both ESP32 cores in parallel.
+ * NanoSatoshi-71: Optimized ESP32 Bitcoin Puzzle Solver
+ * ---------------------------------------------------
+ * Target: Puzzle #71 (Range: 2^70 to 2^71-1)
+ * * Features:
+ * - Dual-core parallel processing
+ * - ECC Point Addition optimization (Q = Q + G)
+ * - Hardware-accelerated SHA256
+ * - NVS Flash storage for found keys (Persistence)
+ * - Watchdog-friendly batching
  */
 
 #include <Arduino.h>
@@ -15,11 +17,12 @@
 
 // --- CONFIGURATION ---
 const int LED_PIN = 2; 
-const int BATCH_SIZE = 100;         // Number of keys per loop before resetting start point
+const int BATCH_SIZE = 100; // Keys per inner loop
 static unsigned long globalTotalKeys = 0;
 portMUX_TYPE timerMux = portMUX_INITIALIZER_UNLOCKED;
+Preferences preferences;
 
-// The RIPEMD160 hash of the public key we are looking for
+// The target RIPEMD160 hash (Example for Puzzle 71)
 const uint8_t TARGET_HASH[20] = {
   0x73, 0x95, 0x42, 0x61, 0x17, 0x36, 0x73, 0x32, 0x76, 0x85, 
   0x65, 0x26, 0x11, 0x86, 0x71, 0x68, 0x61, 0x22, 0x88, 0x33
@@ -28,7 +31,6 @@ const uint8_t TARGET_HASH[20] = {
 volatile bool found = false;
 
 // --- RIPEMD160 IMPLEMENTATION ---
-// Manual implementation as some mbedTLS builds for ESP32 omit RIPEMD160
 typedef struct { uint64_t length; uint32_t state[5]; uint32_t curlen; uint8_t buf[64]; } local_ripemd160_ctx;
 static const uint32_t R160_K[5] = {0x00000000, 0x5a827999, 0x6ed9eba1, 0x8f1bbcdc, 0xa953fd4e};
 static const uint32_t R160_KK[5] = {0x50a28be6, 0x5c4dd124, 0x6d703ef3, 0x7a6d76e9, 0x00000000};
@@ -39,7 +41,6 @@ void local_ripemd160_compress(local_ripemd160_ctx *ctx, const uint8_t *buf) {
     for (int i = 0; i < 16; i++) { X[i] = (uint32_t)buf[i * 4] | ((uint32_t)buf[i * 4 + 1] << 8) | ((uint32_t)buf[i * 4 + 2] << 16) | ((uint32_t)buf[i * 4 + 3] << 24); }
     aa = aaa = ctx->state[0]; bb = bbb = ctx->state[1]; cc = ccc = ctx->state[2]; dd = ddd = ctx->state[3]; ee = eee = ctx->state[4];
     
-    // Round Logic: Left side and Right side parallel processing
     int s[16] = {11,14,15,12,5,8,7,9,11,13,14,15,6,7,9,8}; 
     for(int i=0;i<16;i++) { uint32_t T = aa + (bb ^ cc ^ dd) + X[i] + R160_K[0]; T = ROL(T, s[i]) + ee; aa=ee; ee=dd; dd=ROL(cc,10); cc=bb; bb=T; }
     int s2[16] = {7,6,8,13,11,9,7,15,7,12,15,9,11,7,13,12}; int idx2[16] = {7,4,13,1,10,6,15,3,12,0,9,5,2,14,11,8};
@@ -80,11 +81,9 @@ void local_ripemd160_final(local_ripemd160_ctx *ctx, uint8_t *out) {
     for (int i = 0; i < 5; i++) { out[i * 4] = (uint8_t)(ctx->state[i]); out[i * 4 + 1] = (uint8_t)(ctx->state[i] >> 8); out[i * 4 + 2] = (uint8_t)(ctx->state[i] >> 16); out[i * 4 + 3] = (uint8_t)(ctx->state[i] >> 24); }
 }
 
-// --- SOLVER TASK (Runs on each core) ---
+// --- CORE SOLVER LOGIC ---
 void solverTask(void * parameter) {
   int coreId = (int)parameter;
-  
-  // mbedTLS structures for Elliptic Curve Cryptography
   mbedtls_ecp_group grp;
   mbedtls_ecp_point Q;
   mbedtls_mpi d, one;
@@ -94,7 +93,6 @@ void solverTask(void * parameter) {
   mbedtls_mpi_init(&d);
   mbedtls_mpi_init(&one);
 
-  // Load SECP256K1 curve (Bitcoin standard)
   mbedtls_ecp_group_load(&grp, MBEDTLS_ECP_DP_SECP256K1);
   mbedtls_mpi_lset(&one, 1);
 
@@ -103,53 +101,57 @@ void solverTask(void * parameter) {
   local_ripemd160_ctx ripeCtx;
 
   while(!found) {
-    // 1. Pick a random starting point within the Puzzle 71 range
-    // Range 71 starts at 0x400000000000000000
+    // 1. New random starting point in Puzzle 71 range
     memset(privKeyBytes, 0, 32);
     uint32_t r1 = esp_random(), r2 = esp_random();
-    privKeyBytes[23] = (esp_random() & 0x3F) | 0x40; // Ensure it stays in Puzzle 71 bit range
-    memcpy(&privKeyBytes[24], &r1, 4); 
-    memcpy(&privKeyBytes[28], &r2, 4);
-    
-    // Convert bytes to BigInt
+    privKeyBytes[23] = (esp_random() & 0x3F) | 0x40; 
+    memcpy(&privKeyBytes[24], &r1, 4); memcpy(&privKeyBytes[28], &r2, 4);
     mbedtls_mpi_read_binary(&d, privKeyBytes, 32);
     
-    // Initial Point Calculation: Q = d * G (Expensive operation)
+    // Initial multiplication (Slow, once per batch)
     if (mbedtls_ecp_mul(&grp, &Q, &d, &grp.G, NULL, NULL) != 0) continue;
 
     for (int i = 0; i < BATCH_SIZE; i++) {
-        // Step A: Serialize Public Key to Compressed Format (33 bytes)
+        // PubKey Compressed (33 bytes)
         mbedtls_ecp_point_write_binary(&grp, &Q, MBEDTLS_ECP_PF_COMPRESSED, &olen, pubKeyCompressed, 33);
         
-        // Step B: SHA256 Hash (Hardware accelerated on ESP32)
+        // Hashing Chain
         mbedtls_sha256(pubKeyCompressed, 33, shaResult, 0);
-        
-        // Step C: RIPEMD160 Hash
         local_ripemd160_init(&ripeCtx);
         local_ripemd160_update(&ripeCtx, shaResult, 32);
         local_ripemd160_final(&ripeCtx, ripeResult);
 
-        // Step D: Compare with Target
+        // Check for winner
         if (memcmp(ripeResult, TARGET_HASH, 20) == 0) {
              found = true;
              char hex[67];
              mbedtls_mpi_write_string(&d, 16, hex, 67, &olen);
-             Serial.printf("\n\n!!! WINNER !!! CORE %d FOUND THE KEY: %s\n", coreId, hex);
+             
+             // --- PERSISTENT STORAGE ---
+             preferences.begin("btc_solver", false); 
+             preferences.putString("privkey", hex); 
+             preferences.end();
+             
+             Serial.printf("\n\n!!! WINNER CORE %d !!!\n", coreId);
+             Serial.printf("PRIVATE KEY: %s\n", hex);
+             Serial.println("Key saved to Flash memory.");
+             
+             while(true) { // Alarm blink
+                 digitalWrite(LED_PIN, HIGH); delay(50);
+                 digitalWrite(LED_PIN, LOW); delay(50);
+             }
              break;
         }
 
-        // Step E: Point Addition (Q = Q + G)
-        // Instead of doing full multiplication, we just add the Generator point G
-        // to move to the next private key. This is much faster.
+        // Q = Q + G (Fast point addition)
         if (mbedtls_ecp_muladd(&grp, &Q, &one, &Q, &one, &grp.G) != 0) break;
         mbedtls_mpi_add_mpi(&d, &d, &one);
         
-        // Update statistics periodically (every 10 keys)
         if (i % 10 == 0) {
             portENTER_CRITICAL(&timerMux);
             globalTotalKeys += 10;
             portEXIT_CRITICAL(&timerMux);
-            vTaskDelay(1); // Small delay to prevent Watchdog Reset (WDT)
+            vTaskDelay(1); // Keep Watchdog happy
         }
         if (found) break;
     }
@@ -159,12 +161,25 @@ void solverTask(void * parameter) {
 
 void setup() {
   Serial.begin(115200);
-  setCpuFrequencyMhz(240); // Set ESP32 to max clock speed
-  Serial.println("\n--- ESP32 BITCOIN PUZZLE SOLVER INITIALIZED ---");
+  pinMode(LED_PIN, OUTPUT);
+  setCpuFrequencyMhz(240); 
+  
+  // --- Check if we already found the key in a previous session ---
+  preferences.begin("btc_solver", true);
+  String savedKey = preferences.getString("privkey", "");
+  preferences.end();
 
-  // Create two tasks, one for each core of the ESP32
-  xTaskCreatePinnedToCore(solverTask, "SolverCore0", 16384, (void*)0, 2, NULL, 0);
-  xTaskCreatePinnedToCore(solverTask, "SolverCore1", 16384, (void*)1, 2, NULL, 1);
+  if (savedKey != "") {
+    Serial.println("\n########################################");
+    Serial.println("ALREADY SOLVED! KEY IN MEMORY:");
+    Serial.println(savedKey);
+    Serial.println("########################################");
+    while(true) { digitalWrite(LED_PIN, !digitalRead(LED_PIN)); delay(500); }
+  }
+
+  Serial.println("\n--- NanoSatoshi-71 Starting ---");
+  xTaskCreatePinnedToCore(solverTask, "Solver0", 16384, (void*)0, 2, NULL, 0);
+  xTaskCreatePinnedToCore(solverTask, "Solver1", 16384, (void*)1, 2, NULL, 1);
 }
 
 void loop() {
@@ -174,19 +189,17 @@ void loop() {
   unsigned long now = millis();
   unsigned long timeDiff = now - lastMillis;
 
-  // Print Speed Status every 2 seconds
   if (timeDiff >= 2000) { 
     portENTER_CRITICAL(&timerMux);
     unsigned long currentTotal = globalTotalKeys;
     portEXIT_CRITICAL(&timerMux);
 
-    // Calculate Keys Per Second (K/s)
     float speed = ((float)(currentTotal - lastKeys) / timeDiff) * 1000.0;
-    Serial.printf("Status: %.2f Keys/s | Total Keys: %lu | Uptime: %lu s\n", 
+    Serial.printf("Status: %.2f Keys/s | Total: %lu | Uptime: %lu s\n", 
                   speed, currentTotal, now / 1000);
     
     lastKeys = currentTotal;
     lastMillis = now;
   }
-  delay(100); // Main loop is low priority, solver tasks do the work
+  delay(100);
 }
